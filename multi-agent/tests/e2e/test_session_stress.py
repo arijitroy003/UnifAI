@@ -11,16 +11,28 @@ Test Phases:
 4. Verification - Validate all sessions completed correctly
 5. Metrics - Report performance statistics
 
-Run with:
-    pytest tests/e2e/test_session_stress.py -v -s
-    pytest tests/e2e/test_session_stress.py -v -s --stress-sessions=50 --stress-concurrent=10
+Run with (LLM type/model live in StressTestConfig — only the API key is needed):
+    export STRESS_LLM_API_KEY=...
+    pytest tests/e2e/test_session_stress.py -v -s -o addopts= --import-mode=importlib
+
+    # Use an existing online blueprint (no create/delete of that blueprint)
+    pytest tests/e2e/test_session_stress.py::TestSessionStress::test_concurrent_session_creation_and_execution \
+        -v -s -o addopts= --import-mode=importlib \
+        --blueprint-id=<uuid> --stress-sessions=1 --stress-concurrent=1 \
+        --input-text="your question"
+
+    # Optional: reuse an existing catalog LLM instead of creating one
+    pytest tests/e2e/test_session_stress.py -v -s -o addopts= --import-mode=importlib \
+        --llm-ref=1a8cb722b0954ee7b5554e7bbdad72a0
 """
 
+import os
 import pytest
 import requests
 import time
 import json
 import yaml
+import uuid
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import Dict, List, Tuple, Optional
 from dataclasses import dataclass, field
@@ -37,15 +49,31 @@ class StressTestConfig:
     """Configuration for stress test parameters."""
     # API Configuration
     # base_url: str = "http://localhost:8002"
-    base_url: str = "http://unifai-multiagent-be-tag-ai--pipeline.apps.stc-ai-e1-pp.imap.p1.openshiftapps.com"
-    api_prefix: str = "/api"
+    #base_url: str = "http://unifai-multiagent-be-tag-ai--pipeline.apps.stc-ai-e1-pp.imap.p1.openshiftapps.com"
+    base_url: str = "https://unifai-ui-tag-ai--playground.apps.stc-ai-e1-pp.imap.p1.openshiftapps.com"
+    api_prefix: str = "/api2"
     
     # User Configuration
-    user_id: str = "stress_test_user"
-    
+    #user_id: str = "stress_test_user"
+    user_id: str = "sfiresht"
     # Blueprint Configuration
     blueprint_path: Optional[str] = None  # Path to YAML blueprint file
+    # Existing online blueprint ID — skip create/delete when set
+    blueprint_id: Optional[str] = None
     input_text: str = "What is 2+2?"  # Input text for execution
+
+    # -------------------------------------------------------------------------
+    # LLM Configuration (edit here — don't pass CLI flags for these)
+    # By default the test creates a temporary catalog LLM from llm_* below
+    # and wires it as $ref:<rid>. Override with --llm-ref to reuse an existing one.
+    # -------------------------------------------------------------------------
+    create_llm: bool = True
+    llm_ref: Optional[str] = None  # set / pass --llm-ref to skip create
+    llm_api_key: Optional[str] = None  # from STRESS_LLM_API_KEY / --llm-api-key
+    llm_type: str = "google_genai"  # google_genai | openai
+    llm_model: str = "gemini-2.5-flash"
+    llm_base_url: str = "https://generativelanguage.googleapis.com/v1beta/openai"
+    llm_name: str = "stress_test_llm"
     
     # Execution Configuration
     use_streaming: bool = False  # Use streaming mode (prevents gateway timeouts)
@@ -67,6 +95,9 @@ class StressTestConfig:
     # Verification Configuration
     verify_state: bool = True
     verify_status: bool = True
+
+    # Cleanup: when False, leave sessions (chats) and created blueprints in place
+    cleanup_sessions: bool = True
 
 
 @dataclass
@@ -146,6 +177,10 @@ class SessionAPIClient:
         self.config = config
         self.base_url = f"{config.base_url}{config.api_prefix}"
         self.session = requests.Session()
+        self.session.verify = False
+        self.session.headers.update({
+            "X-Authenticated-User": self.config.user_id
+        })
     
     def create_blueprint(self, blueprint_dict: Dict) -> str:
         """Create a blueprint and return its ID."""
@@ -265,6 +300,72 @@ class SessionAPIClient:
         
         return response.json()
     
+    def create_llm_resource(
+        self,
+        *,
+        name: str,
+        llm_type: str,
+        model_name: str,
+        api_key: str,
+        base_url: Optional[str] = None,
+    ) -> str:
+        """Create a catalog LLM via /resources/resource.save and return its rid."""
+        url = f"{self.base_url}/resources/resource.save"
+        llm_type = llm_type.strip().lower()
+
+        if llm_type == "google_genai":
+            config = {
+                "type": "google_genai",
+                "model_name": model_name,
+                "api_key": api_key,
+            }
+        elif llm_type == "openai":
+            config = {
+                "type": "openai",
+                "model_name": model_name,
+                "api_key": api_key,
+                "base_url": base_url or "https://generativelanguage.googleapis.com/v1beta/openai",
+                "verify_ssl": True,
+            }
+        else:
+            raise ValueError(
+                f"Unsupported llm_type '{llm_type}'. Use 'google_genai' or 'openai'."
+            )
+
+        payload = {
+            "category": "llms",
+            "type": llm_type,
+            "name": name,
+            "config": config,
+            "userId": self.config.user_id,
+        }
+
+        response = self.session.post(url, json=payload, timeout=self.config.creation_timeout)
+        if response.status_code >= 400:
+            detail = response.text[:500]
+            raise requests.exceptions.HTTPError(
+                f"{response.status_code} creating LLM resource: {detail}",
+                response=response,
+            )
+        result = response.json()
+        rid = result.get("rid")
+        if not rid:
+            raise RuntimeError(f"resource.save returned no rid: {result}")
+        return rid
+
+    def delete_resource(self, resource_id: str) -> bool:
+        """Delete a catalog resource by id."""
+        url = f"{self.base_url}/resources/resource.delete"
+        params = {"resourceId": resource_id}
+
+        try:
+            response = self.session.delete(url, params=params)
+            response.raise_for_status()
+            return True
+        except Exception as e:
+            print(f"  ⚠️  Warning: Failed to delete resource {resource_id[:8]}...: {e}")
+            return False
+
     def delete_blueprint(self, blueprint_id: str) -> bool:
         """Delete a blueprint."""
         url = f"{self.base_url}/blueprints/remove.blueprint"
@@ -296,17 +397,52 @@ class SessionAPIClient:
 # SAMPLE BLUEPRINT
 # =============================================================================
 
-def get_stress_test_blueprint() -> Dict:
+def _normalize_llm_ref(llm_ref: str) -> str:
+    """Ensure catalog LLM refs use the $ref: prefix Temporal mini-blueprints require."""
+    ref = (llm_ref or "").strip()
+    if not ref:
+        raise ValueError("llm_ref must not be empty")
+    if not ref.startswith("$ref:"):
+        ref = f"$ref:{ref}"
+    return ref
+
+
+def resolve_blueprint_id(
+    api_client: "SessionAPIClient",
+    stress_config: StressTestConfig,
+    blueprint_dict: Optional[Dict],
+) -> Tuple[str, bool]:
+    """
+    Resolve which blueprint to use.
+
+    Returns:
+        (blueprint_id, created_by_test) — when created_by_test is False, do not delete it.
+    """
+    if stress_config.blueprint_id:
+        blueprint_id = stress_config.blueprint_id.strip()
+        print(f"📄 Using existing online blueprint: {blueprint_id}")
+        return blueprint_id, False
+
+    if blueprint_dict is None:
+        raise ValueError(
+            "No blueprint available. Pass --blueprint-id, --blueprint-path, "
+            "or use the default stress blueprint."
+        )
+
+    blueprint_id = api_client.create_blueprint(blueprint_dict)
+    print(f"✅ Blueprint created: {blueprint_id}")
+    return blueprint_id, True
+
+
+def get_stress_test_blueprint(llm_ref: str) -> Dict:
     """
     Returns a simple blueprint for stress testing.
-    
-    This blueprint is designed to be:
-    - Fast to execute (minimal external dependencies)
-    - Reliable (no flaky external calls)
-    - Deterministic (predictable outputs)
-    
-    Structure follows the standard blueprint format with rid-based references.
+
+    Uses a catalog LLM via `$ref:<rid>` (no inline LLM / api_key). This matches
+    playground Temporal execution, which only packs `$ref:` deps into worker
+    mini-blueprints.
     """
+    catalog_llm = _normalize_llm_ref(llm_ref)
     return {
         "description": "A simple agent pipeline for stress testing session creation and execution",
         "name": "Stress Test Blueprint",
@@ -317,21 +453,9 @@ def get_stress_test_blueprint() -> Dict:
         "providers": [],
         
         # ----------------------------
-        # LLM Definitions
+        # LLM Definitions (catalog $ref only — no inline credentials)
         # ----------------------------
-        "llms": [
-            {
-                "rid": "stress_test_llm_rid",
-                "name": "stress_test_llm",
-                "type": "openai",
-                "config": {
-                    "type": "openai",
-                    "model_name": "gemini-2.5-flash",
-                    "api_key": "",
-                    "base_url": "https://generativelanguage.googleapis.com/v1beta/openai"
-                }
-            }
-        ],
+        "llms": [],
         
         # ----------------------------
         # Retriever
@@ -366,7 +490,7 @@ def get_stress_test_blueprint() -> Dict:
                 "type": "custom_agent_node",
                 "config": {
                     "type": "custom_agent_node",
-                    "llm": "stress_test_llm_rid",
+                    "llm": catalog_llm,
                     "system_message": "You are a helpful assistant. Answer the user's question directly and concisely in one or two sentences."
                 }
             },
@@ -642,7 +766,7 @@ class StressTestRunner:
 
 @pytest.fixture
 def stress_config(request):
-    """Configuration fixture with CLI overrides."""
+    """Configuration fixture with CLI / env overrides."""
     config = StressTestConfig()
     
     # Allow CLI overrides
@@ -650,12 +774,46 @@ def stress_config(request):
         config.num_sessions = request.config.option.stress_sessions
     if hasattr(request.config.option, 'stress_concurrent'):
         config.concurrent_execute = request.config.option.stress_concurrent
+    if hasattr(request.config.option, 'stress_base_url') and request.config.option.stress_base_url:
+        config.base_url = request.config.option.stress_base_url
     if hasattr(request.config.option, 'blueprint_path'):
         config.blueprint_path = request.config.option.blueprint_path
+    if getattr(request.config.option, 'blueprint_id', None):
+        config.blueprint_id = request.config.option.blueprint_id.strip()
+        # Existing online blueprint already has its own LLM wiring
+        config.create_llm = False
     if hasattr(request.config.option, 'input_text'):
         config.input_text = request.config.option.input_text
     if hasattr(request.config.option, 'use_streaming'):
         config.use_streaming = request.config.option.use_streaming
+
+    # Optional CLI overrides for LLM fields (config defaults are the normal path)
+    if getattr(request.config.option, 'llm_type', None):
+        config.llm_type = request.config.option.llm_type
+    if getattr(request.config.option, 'llm_model', None):
+        config.llm_model = request.config.option.llm_model
+    if getattr(request.config.option, 'llm_base_url', None):
+        config.llm_base_url = request.config.option.llm_base_url
+    if getattr(request.config.option, 'llm_name', None):
+        config.llm_name = request.config.option.llm_name
+
+    # --llm-ref wins: reuse existing catalog LLM, do not create
+    if getattr(request.config.option, 'llm_ref', None):
+        config.llm_ref = _normalize_llm_ref(request.config.option.llm_ref)
+        config.create_llm = False
+    elif getattr(request.config.option, 'create_llm', False):
+        config.create_llm = True
+
+    # API key: CLI > STRESS_LLM_API_KEY > LLM_API_KEY
+    cli_key = getattr(request.config.option, 'llm_api_key', None)
+    config.llm_api_key = (
+        cli_key
+        or os.environ.get("STRESS_LLM_API_KEY")
+        or os.environ.get("LLM_API_KEY")
+    )
+
+    if getattr(request.config.option, 'stress_no_cleanup', False):
+        config.cleanup_sessions = False
     
     return config
 
@@ -667,10 +825,65 @@ def api_client(stress_config):
 
 
 @pytest.fixture
-def test_blueprint(stress_config):
-    """Test blueprint fixture - loads from file if path provided."""
+def catalog_llm(stress_config, api_client):
+    """
+    Resolve the catalog LLM `$ref` for the default stress blueprint.
+
+    - `--create-llm`: POST /resources/resource.save, wire `$ref:<rid>`, delete on teardown
+    - `--llm-ref`: reuse an existing catalog LLM
+    - skipped when `--blueprint-path` or `--blueprint-id` supplies the workflow
+    """
+    if stress_config.blueprint_path or stress_config.blueprint_id:
+        yield None
+        return
+
+    created_rid: Optional[str] = None
+
+    if stress_config.create_llm:
+        if not stress_config.llm_api_key:
+            pytest.fail(
+                "LLM create is enabled (StressTestConfig.create_llm=True) but no API key "
+                "was found. Set STRESS_LLM_API_KEY / LLM_API_KEY or pass --llm-api-key, "
+                "or reuse an existing LLM with --llm-ref."
+            )
+        unique_name = f"{stress_config.llm_name}_{uuid.uuid4().hex[:8]}"
+        print(f"🧠 Creating catalog LLM '{unique_name}' "
+              f"(type={stress_config.llm_type}, model={stress_config.llm_model})")
+        created_rid = api_client.create_llm_resource(
+            name=unique_name,
+            llm_type=stress_config.llm_type,
+            model_name=stress_config.llm_model,
+            api_key=stress_config.llm_api_key,
+            base_url=stress_config.llm_base_url,
+        )
+        llm_ref = _normalize_llm_ref(created_rid)
+        stress_config.llm_ref = llm_ref
+        print(f"   ✅ Created catalog LLM: {llm_ref}")
+    elif stress_config.llm_ref:
+        llm_ref = _normalize_llm_ref(stress_config.llm_ref)
+        stress_config.llm_ref = llm_ref
+        print(f"📄 Using existing catalog LLM: {llm_ref}")
+    else:
+        pytest.fail(
+            "No LLM configured. Set StressTestConfig.create_llm=True with an API key, "
+            "or pass --llm-ref <catalog-rid>."
+        )
+
+    yield llm_ref
+
+    if created_rid:
+        print(f"🧹 Deleting auto-created catalog LLM {created_rid[:8]}...")
+        if api_client.delete_resource(created_rid):
+            print("  ✅ Catalog LLM deleted")
+
+
+@pytest.fixture
+def test_blueprint(stress_config, catalog_llm) -> Optional[Dict]:
+    """Blueprint dict to upload, or None when using --blueprint-id."""
+    if stress_config.blueprint_id:
+        return None
+
     if stress_config.blueprint_path:
-        # Load from YAML file
         from pathlib import Path
         
         blueprint_file = Path(stress_config.blueprint_path)
@@ -684,9 +897,8 @@ def test_blueprint(stress_config):
         blueprint_name = blueprint.get('name', 'Unknown')
         print(f"   Blueprint: {blueprint_name}")
         return blueprint
-    else:
-        # Use default stress test blueprint
-        return get_stress_test_blueprint()
+
+    return get_stress_test_blueprint(catalog_llm)
 
 
 @pytest.fixture
@@ -711,7 +923,7 @@ class TestSessionStress:
         self,
         stress_config: StressTestConfig,
         api_client: SessionAPIClient,
-        test_blueprint: Dict,
+        test_blueprint: Optional[Dict],
         stress_runner: StressTestRunner
     ):
         """
@@ -724,6 +936,7 @@ class TestSessionStress:
         4. Performance meets acceptable thresholds
         """
         blueprint_id = None
+        owns_blueprint = False
         session_ids = []
         
         try:
@@ -735,17 +948,24 @@ class TestSessionStress:
             print(f"  • Concurrent Creates: {stress_config.concurrent_create}")
             print(f"  • Concurrent Executes: {stress_config.concurrent_execute}")
             print(f"  • Streaming Mode: {'ENABLED ✓' if stress_config.use_streaming else 'DISABLED'}")
-            print(f"  • API: {stress_config.base_url}")
+            print(f"  • API: {stress_config.base_url}{stress_config.api_prefix}")
+            if stress_config.blueprint_id:
+                print(f"  • Blueprint ID: {stress_config.blueprint_id}")
+            if stress_config.create_llm:
+                print(f"  • LLM mode: create ({stress_config.llm_type}/{stress_config.llm_model})")
+            if stress_config.llm_ref:
+                print(f"  • Catalog LLM: {stress_config.llm_ref}")
             
             stress_runner.metrics.total_start_time = time.time()
             
-            # PHASE 1: Create Blueprint
+            # PHASE 1: Blueprint Setup
             print(f"\n{'=' * 80}")
             print("📋 PHASE 1: Blueprint Setup")
             print(f"{'=' * 80}")
             
-            blueprint_id = api_client.create_blueprint(test_blueprint)
-            print(f"✅ Blueprint created: {blueprint_id}")
+            blueprint_id, owns_blueprint = resolve_blueprint_id(
+                api_client, stress_config, test_blueprint
+            )
             
             # PHASE 2: Concurrent Session Creation
             print(f"\n{'=' * 80}")
@@ -810,29 +1030,39 @@ class TestSessionStress:
             print(f"\n{'=' * 80}")
             print("🧹 CLEANUP PHASE")
             print(f"{'=' * 80}")
-            
-            # Delete sessions
-            if session_ids:
-                print(f"Deleting {len(session_ids)} sessions...")
-                deleted_count = 0
+
+            if not stress_config.cleanup_sessions:
+                print("  ⏭️  --stress-no-cleanup: leaving sessions/chats in place")
                 for session_id in session_ids:
-                    if api_client.delete_session(session_id):
-                        deleted_count += 1
-                print(f"  ✅ Deleted {deleted_count}/{len(session_ids)} sessions")
-            
-            # Delete blueprint
-            if blueprint_id:
-                print(f"Deleting blueprint {blueprint_id[:8]}...")
-                if api_client.delete_blueprint(blueprint_id):
-                    print(f"  ✅ Blueprint deleted")
-            
-            print("✅ Cleanup complete\n")
-    
+                    print(f"     session: {session_id}")
+                if blueprint_id:
+                    print(f"  ⏭️  Leaving blueprint {blueprint_id[:8]}... in place")
+                print("✅ Cleanup skipped\n")
+            else:
+                # Delete sessions
+                if session_ids:
+                    print(f"Deleting {len(session_ids)} sessions...")
+                    deleted_count = 0
+                    for session_id in session_ids:
+                        if api_client.delete_session(session_id):
+                            deleted_count += 1
+                    print(f"  ✅ Deleted {deleted_count}/{len(session_ids)} sessions")
+
+                # Only delete blueprints this test created
+                if blueprint_id and owns_blueprint:
+                    print(f"Deleting blueprint {blueprint_id[:8]}...")
+                    if api_client.delete_blueprint(blueprint_id):
+                        print(f"  ✅ Blueprint deleted")
+                elif blueprint_id:
+                    print(f"  ⏭️  Leaving existing blueprint {blueprint_id[:8]}... in place")
+
+                print("✅ Cleanup complete\n")
+
     def test_rapid_sequential_sessions(
         self,
         stress_config: StressTestConfig,
         api_client: SessionAPIClient,
-        test_blueprint: Dict
+        test_blueprint: Optional[Dict]
     ):
         """
         Test rapid sequential session creation and execution.
@@ -843,6 +1073,7 @@ class TestSessionStress:
         - Maintains performance consistency
         """
         blueprint_id = None
+        owns_blueprint = False
         session_ids = []
         
         try:
@@ -850,9 +1081,9 @@ class TestSessionStress:
             print("🧪 RAPID SEQUENTIAL SESSION TEST")
             print(f"{'=' * 80}")
             
-            # Create blueprint
-            blueprint_id = api_client.create_blueprint(test_blueprint)
-            print(f"✅ Blueprint created: {blueprint_id}")
+            blueprint_id, owns_blueprint = resolve_blueprint_id(
+                api_client, stress_config, test_blueprint
+            )
             
             num_rapid_sessions = 10
             # ✅ CORRECTED INPUT FORMAT
@@ -898,23 +1129,32 @@ class TestSessionStress:
             print(f"\n{'=' * 80}")
             print("🧹 CLEANUP PHASE")
             print(f"{'=' * 80}")
-            
-            # Delete sessions
-            if session_ids:
-                print(f"Deleting {len(session_ids)} sessions...")
-                deleted_count = 0
+
+            if not stress_config.cleanup_sessions:
+                print("  ⏭️  --stress-no-cleanup: leaving sessions/chats in place")
                 for session_id in session_ids:
-                    if api_client.delete_session(session_id):
-                        deleted_count += 1
-                print(f"  ✅ Deleted {deleted_count}/{len(session_ids)} sessions")
-            
-            # Delete blueprint
-            if blueprint_id:
-                print(f"Deleting blueprint {blueprint_id[:8]}...")
-                if api_client.delete_blueprint(blueprint_id):
-                    print(f"  ✅ Blueprint deleted")
-            
-            print("✅ Cleanup complete\n")
+                    print(f"     session: {session_id}")
+                if blueprint_id:
+                    print(f"  ⏭️  Leaving blueprint {blueprint_id[:8]}... in place")
+                print("✅ Cleanup skipped\n")
+            else:
+                # Delete sessions
+                if session_ids:
+                    print(f"Deleting {len(session_ids)} sessions...")
+                    deleted_count = 0
+                    for session_id in session_ids:
+                        if api_client.delete_session(session_id):
+                            deleted_count += 1
+                    print(f"  ✅ Deleted {deleted_count}/{len(session_ids)} sessions")
+
+                if blueprint_id and owns_blueprint:
+                    print(f"Deleting blueprint {blueprint_id[:8]}...")
+                    if api_client.delete_blueprint(blueprint_id):
+                        print(f"  ✅ Blueprint deleted")
+                elif blueprint_id:
+                    print(f"  ⏭️  Leaving existing blueprint {blueprint_id[:8]}... in place")
+
+                print("✅ Cleanup complete\n")
 
 
 # =============================================================================
@@ -928,14 +1168,17 @@ class TestCustomBlueprintStress:
     """Stress tests using your custom blueprint."""
     
     @pytest.fixture
-    def custom_blueprint(self, stress_config):
+    def custom_blueprint(self, stress_config, catalog_llm) -> Optional[Dict]:
         """
         Load your custom blueprint - from file or default.
         
-        Uses --blueprint-path CLI option if provided, otherwise uses default.
+        None when --blueprint-id is set. Otherwise --blueprint-path or the
+        default stress blueprint wired to catalog_llm.
         """
+        if stress_config.blueprint_id:
+            return None
+
         if stress_config.blueprint_path:
-            # Load from file specified in CLI
             from pathlib import Path
             
             blueprint_file = Path(stress_config.blueprint_path)
@@ -949,9 +1192,8 @@ class TestCustomBlueprintStress:
             blueprint_name = blueprint.get('name', 'Unknown')
             print(f"   Blueprint: {blueprint_name}")
             return blueprint
-        else:
-            # Default to stress test blueprint
-            return get_stress_test_blueprint()
+
+        return get_stress_test_blueprint(catalog_llm)
     
     @pytest.fixture
     def custom_inputs(self, stress_config):
@@ -966,7 +1208,7 @@ class TestCustomBlueprintStress:
         self,
         stress_config: StressTestConfig,
         api_client: SessionAPIClient,
-        custom_blueprint: Dict,
+        custom_blueprint: Optional[Dict],
         custom_inputs: Dict,
         stress_runner: StressTestRunner
     ):
@@ -976,6 +1218,7 @@ class TestCustomBlueprintStress:
         Modify this test to match your blueprint's specific needs.
         """
         blueprint_id = None
+        owns_blueprint = False
         session_ids = []
         
         try:
@@ -985,9 +1228,9 @@ class TestCustomBlueprintStress:
             
             stress_runner.metrics.total_start_time = time.time()
             
-            # Create blueprint
-            blueprint_id = api_client.create_blueprint(custom_blueprint)
-            print(f"✅ Custom blueprint created: {blueprint_id}")
+            blueprint_id, owns_blueprint = resolve_blueprint_id(
+                api_client, stress_config, custom_blueprint
+            )
             
             # Create sessions concurrently
             session_ids = stress_runner.run_concurrent_creation(blueprint_id)
@@ -1016,21 +1259,30 @@ class TestCustomBlueprintStress:
             print(f"\n{'=' * 80}")
             print("🧹 CLEANUP PHASE")
             print(f"{'=' * 80}")
-            
-            # Delete sessions
-            if session_ids:
-                print(f"Deleting {len(session_ids)} sessions...")
-                deleted_count = 0
+
+            if not stress_config.cleanup_sessions:
+                print("  ⏭️  --stress-no-cleanup: leaving sessions/chats in place")
                 for session_id in session_ids:
-                    if api_client.delete_session(session_id):
-                        deleted_count += 1
-                print(f"  ✅ Deleted {deleted_count}/{len(session_ids)} sessions")
-            
-            # Delete blueprint
-            if blueprint_id:
-                print(f"Deleting blueprint {blueprint_id[:8]}...")
-                if api_client.delete_blueprint(blueprint_id):
-                    print(f"  ✅ Blueprint deleted")
-            
-            print("✅ Cleanup complete\n")
+                    print(f"     session: {session_id}")
+                if blueprint_id:
+                    print(f"  ⏭️  Leaving blueprint {blueprint_id[:8]}... in place")
+                print("✅ Cleanup skipped\n")
+            else:
+                # Delete sessions
+                if session_ids:
+                    print(f"Deleting {len(session_ids)} sessions...")
+                    deleted_count = 0
+                    for session_id in session_ids:
+                        if api_client.delete_session(session_id):
+                            deleted_count += 1
+                    print(f"  ✅ Deleted {deleted_count}/{len(session_ids)} sessions")
+
+                if blueprint_id and owns_blueprint:
+                    print(f"Deleting blueprint {blueprint_id[:8]}...")
+                    if api_client.delete_blueprint(blueprint_id):
+                        print(f"  ✅ Blueprint deleted")
+                elif blueprint_id:
+                    print(f"  ⏭️  Leaving existing blueprint {blueprint_id[:8]}... in place")
+
+                print("✅ Cleanup complete\n")
 
