@@ -3,6 +3,7 @@ from typing import Callable
 
 from flask import Blueprint, jsonify, current_app, request
 
+from adapters.inbound.flask.user_token import get_user_token
 from utils.directory_cache import DirectoryCache
 
 logger = logging.getLogger(__name__)
@@ -18,13 +19,8 @@ def _parse_limit(default: int = 20) -> int:
 
 
 def _user_token():
-    """Retrieve the user's access token from the server-side session."""
-    auth_manager = current_app.extensions.get('auth_manager')
-    if auth_manager:
-        session_data = auth_manager._get_server_session()
-        if session_data:
-            return session_data.get('access_token')
-    return request.headers.get("X-User-Token")  # ponytail: fallback for backward compat
+    """Retrieve the user's access token from the server session or X-User-Token."""
+    return get_user_token()
 
 
 def _cached_fetch(cache, cache_key: str, fetch: Callable, response_key: str, log_action: str):

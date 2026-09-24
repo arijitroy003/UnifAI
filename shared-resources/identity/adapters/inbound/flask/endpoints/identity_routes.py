@@ -1,5 +1,11 @@
+import logging
+
 from flask import Blueprint, jsonify, current_app, request
 from models.identity import Identity
+
+from adapters.inbound.flask.user_token import get_user_token
+
+logger = logging.getLogger(__name__)
 
 identity_bp = Blueprint("identity", __name__)
 
@@ -27,14 +33,7 @@ def resolve_identity():
 
         if identity_type == "user":
             if svc.has_directory:
-                auth_manager = current_app.extensions.get('auth_manager')
-                token = None
-                if auth_manager:
-                    sd = auth_manager._get_server_session()
-                    if sd:
-                        token = sd.get('access_token')
-                if not token:
-                    token = request.headers.get("X-User-Token")  # ponytail: backward compat fallback
+                token = get_user_token()
                 user = svc.get_directory_user(identity_id, user_token=token)
                 if user:
                     identity = Identity.user(
@@ -50,5 +49,6 @@ def resolve_identity():
 
     except KeyError:
         return jsonify({"error": "Identity not found"}), 404
-    except Exception as e:
-        return jsonify({"error": str(e)}), 500
+    except Exception:
+        logger.exception("resolve_identity failed")
+        return jsonify({"error": "Internal server error"}), 500
